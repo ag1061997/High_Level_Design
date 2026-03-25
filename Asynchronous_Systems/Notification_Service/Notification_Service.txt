@@ -1,0 +1,249 @@
+######### Functional Requirements ###################
+-----------------------------------------------------
+1. System support multiple channels like 
+    EMAIL, 
+    SMS, 
+    PUSH, 
+    IN-APP messages.
+
+2. Support multiple notification type like 
+    Transactional (Order Confirmation), 
+    Promotional (Discount Offers), 
+    System Generated Alerts (Password Reset).
+
+3. Support Scheduling for future notifications.
+4. Support Rate limiter for the Promotional notifications for a user on a given day.
+5. Handle notification delivery failure by retry mechanism.
+
+
+######## Non Functional Requirements ##################
+-------------------------------------------------------
+1. Scalable: Support millions of notification/min and millions of concurrent users.
+2. High Available: Minimal downtime so that notification is delivered in case of failure also.
+3. Reliability: Guarantee atleast one delivery of notification.
+4. Low Latency: Notification should be sent quickly for timely delivery.
+
+
+############## Scale Estimation ########################
+--------------------------------------------------------
+
+=> Assumptions: 1. Users: 50 millions per day
+                2. Notifications per user: 5 per day
+                3. Peak load: 1 million notifications per minute
+                4. Notification Size: 1KB per notification
+                5. User Data Size: 1KB per notification
+
+=> Notification Per Day: (5 * (50 millions)) = 250 millions per day.
+=> Peak Notification Per Second: (1 million / 60) ~ 17000 notification per second.
+
+=> Storage Requirements: 1. Storage for user data: (50 million * 1 KB) = 50 GB
+                         2. Daily Storage for notifications: (50 million * 5 * 1KB) = 250 GB
+
+
+############### High Level Design #######################
+---------------------------------------------------------
+
+=> Notification Service: 1. It is entry point for all notification requests, It exposes APIs for internal and external systems.
+                         2. Request is validated such as recipient ID, notification type, message content, notification channel.
+                         3. For future notifications, It integrate with the Scheduler Service.
+                         4. After processing request, It pushes the notification to Notification Queue (Kafka, RabbitMQ, Amazon SQS).
+
+=> User Preference Service: 1. It stores and retrieve user preferences for receiving notification across different channels.
+                            2. It enforces the frequency limit for certain notifications like Promotional.
+
+=> Scheduler Service: 1. It is responsible for storing and tracking scheduled notifications like reminders, promotional campaigns.
+                      2. Once time arrive, It pulls the notification from storage and send to Notification Queue.
+
+=> Notification Queue: 1. It act as buffer between Notification Service and Channel Processors. 
+                       2. It enables the system to scale efficiently during peak time.
+                       3. It can be configured for atleast one delivery or exactly one delivery.
+
+=> Channel Processors: 1. It pulls the notification from Notification Queue and deliver them to users via specific channel.
+                       2. It enables independent scaling and asynchronous processing of notification.
+                       3. It allows each processor to focus on designated channel, ensure reliable delivery with built-in retry system.
+
+=> Database/Storage: 1. It manage large volume of data like notification content, user preference, scheduled notification, delivery logs, metadata.
+                     2. Relational Database like Mysql used for structured data like notification logs and delivery status.
+                     3. NoSql Database (DynamoDB or MongoDB) used for large volume of user specific data like preferences and rate limits.
+                     4. For large attachments in emails we use blob storage like Amazon S3.
+
+
+################## Detailed Design #########################
+------------------------------------------------------------
+
+=> Notification Creation: External Service or Internal Service generates notification request.
+                          {
+                            "requestId": "abc123",
+                            "timestamp": "2024-09-17T14:00:00Z",
+                            "notificationType": "transactional",
+                            "channels": ["email", "sms", "push"],
+                            "recipient": {
+                                "userId": "user789",
+                                "email": "user@example.com"
+                            },
+                            "message": {
+                                "subject": "Order Confirmation",
+                                "body": "Thank you for your order! Your order #123456 has been confirmed.",
+                                "attachments": ["https://example.com/invoice123456.pdf"],
+                                "smsText": "Thank you for your order! Order #123456 confirmed.",
+                                "pushNotification": {
+                                    "title": "Order Confirmed",
+                                    "body": "Your order #123456 has been confirmed. Check your email for details.",
+                                    "icon": "https://example.com/icon.png",
+                                    "action": {
+                                        "type": "viewOrder",
+                                        "url": "https://example.com/order/123456"
+                                    }
+                                }
+                            },
+                            "schedule": {
+                                "sendAt": "2024-09-17T15:00:00Z"
+                            },
+                            "metadata": {
+                                "priority": "high",
+                                "retries": 3
+                            }
+                        }
+
+=> Notification Service Ingestion: 1. It receive request via (API Gateway/Load Balancer).
+                                   2. It authenticate and validate the request like recipient, message, channels etc are present or not.
+
+=> Fetching User preference: 1. Notification service query User Preference Service to fetch Preferred Notification Channels, Opt-in/Opt-out Preferences, Rate Limits.
+                             2. Sample response:
+                             {
+                                "userId": "user789",
+                                "preferences": {
+                                    "channels": {
+                                        "transactional": ["email", "push"],
+                                        "promotional": ["sms"],
+                                        "systemAlert": ["push", "sms"]
+                                    },
+                                    "doNotDisturb": {
+                                        "enabled": true,
+                                        "startTime": "22:00",
+                                        "endTime": "08:00",
+                                        "timezone": "America/New_York"
+                                    },
+                                    "dailyLimits": {
+                                        "promotionalLimit": 2,
+                                        "promotionalSentToday": 1
+                                    },
+                                    "optOut": {
+                                        "email": false,
+                                        "sms": false,
+                                        "push": false
+                                    },
+                                    "preferredTimeForDelivery": {
+                                        "enabled": true,
+                                        "startTime": "09:00",
+                                        "endTime": "21:00",
+                                        "timezone": "America/New_York"
+                                    }
+                                }
+                            }
+
+=> Scheduling (If required): 1. Notification Service send the notification to Scheduler Service.
+                             2. Scheduler Service store notification with scheduled delivery time in time-based data based/Nosql DB for efficient querying based on time.
+                             3. Table name is scheduled_notifications {id, user_id, notification_type, channels, schedule_time, timezone, message_content, status, priority, retry_count}.
+                             4. scheduled_notifications table is partitioned on schedule_time, so system query efficiently within relevant time limit instead of scanning entire table.
+                             5. Schedule Service continuously queries for notifications that are due for delivery like notifications that are need to be delivered in next 1-5 minutes.
+                             6. When time arrive, Scheduler service takes the notifications and push it into Notification Queue.
+
+=> Message Creation and Formatting: 1. Based on user preference and request, Notification service uses templates(if needed) to format message for each channel.
+                                    2. Sample Email Message:
+                                        {
+                                            "messageId": "msg12345",
+                                            "timestamp": "2024-09-17T14:00:00Z",
+                                            "notificationType": "transactional",
+                                            "channel": "email",
+                                            "recipient": {
+                                                "userId": "user789",
+                                                "email": "user@example.com"
+                                            },
+                                            "messageContent": {
+                                                "subject": "Order Confirmation - Order #123456",
+                                                "body": {
+                                                    "html": "<html><body><h1>Thank you for your order!</h1><p>Your order #123456 has been confirmed. You can track your order <a href='https://example.com/track'>here</a>.</p></body></html>",
+                                                    "plainText": "Thank you for your order! Your order #123456 has been confirmed. Track your order here: https://example.com/track"
+                                                },
+                                                "attachments": [
+                                                    {
+                                                        "url": "https://example.com/invoice123456.pdf",
+                                                        "fileName": "invoice123456.pdf",
+                                                        "mimeType": "application/pdf"
+                                                    }
+                                                ]
+                                            },
+                                            "metadata": {
+                                                "priority": "high",
+                                                "retries": 3,
+                                                "sentBy": "OrderService",
+                                                "templateId": "orderConfirmationTemplate",
+                                                "requestId": "req9876"
+                                            }
+                                        }
+
+=> Queueing the Notification: 1. Notification Service places each message in respective topic in Notification Queue.
+                              2. Each channel has dedicated topic, ensure message get processed independently by relevant channel processors.
+                              3. Each Channel Processor focus on consuming messages relevent to its channel, reducing complexity and improve processing efficiency.
+                              4. Each message contain notification payload, channel-specific information, metadata(priority or retry count).
+
+=> Channel Specific Message Processing: 1. Each channel processor acts as a consumer to the queue and responsible for consuming its own messages.
+
+=> Sending the notification: 1. Email Processor:
+                                a. Connect to email provider (SendGrid, mailgun, Amazon SES).
+                                b. Send the email.
+                                c. Handle errors like bounces or invalid email addresses.
+
+                             2. SMS Processor:
+                                a. Connect to SMS provider (Twilio, Nexmo, Airtel).
+                                b. Send the sms with any formatting adjustments to meet character limit or regional requirement.
+                                c. Handle issues such as invalid phone number or network error.
+
+                             3. Push Notification Processor:
+                                a. Use service like Firebase Cloud Messaging(FCM) for Android or Apple Push Notification Service (APNs) for ios.
+                                b. Send the push notification, include metadata(e.g app-specific actions or icons).
+                                c. Handle failures such as expired device tokens or offline devices.
+
+                             4. In-App Notification Processor:
+                                a. Send the in-app notification via Websockets or long polling to user active session.
+                                b. Formats the message for display in app UI, follow app specific display rules.
+
+=> Monitoring and Delivery Confirmation: 1. Each channel processor waits for the acknowledgment from external provider like success or failed.
+                                         2. Each channel processor logs notification status in notification_logs table for future reference, auditing and reporting.
+                                         3. notification_logs (log_id, notification_id, channel, status, error_message, retry_count, sent_at, delivered_at).
+
+
+############## Addressing Bottleneck #############################
+------------------------------------------------------------------
+
+=> Handling Failures and Retries: 1. Channel processor atemp to retry the request using exponential backoff strategy, where each retry delayed by longer time.
+                                  2. If it remains undelivered after set of retries, it is moved to Dead Letter Queue(DLQ).
+                                  3. Administrator manually review and reprocess from the DLQ.
+
+=> Scalability: 1. Horizontal scaling 
+                    a. Add additional instances to manage increased load.
+                    b. Distributed queues like kafka are naturally scale to handle larger workload by distributing the queues across multiple modes.
+                    c. Each channel processor should horizontally scale large volumes of notifications.
+
+                2. Sharding and Partitioning
+                    a. Distribute users across different DBs or regions based on geographic location or user ID to balance the load.
+                    b. Organize notification logs into time-based partitions (daily or monthly) to improve queries and manage old data.
+
+                3. Caching
+                    a. Use caching solutions like Redis or Memcached to store frequent access data like user preferences.
+                    b. It reduce load on main DB and also improve response time by avoiding repeated database lookups.
+
+=> Reliability: 1. For high availability, data (user preference, logs) will be replicated to multiple data centers or regions (Availability Zones).
+                2. Load balancer distribute traffic evenly among instances of notification service.
+
+=> Monitoring and Logging: 1. Use tools like ELK Stack or Prometheus/Grafana to collect logs from various components and monitor health of system.
+                           2. Set up alerts for failure (delivery failure exceed threshold).
+                           3. Track metrics like success rate, failure rate, delivery latency and throughput for each channel.
+
+=> Security: 1. Implement rate limiter on API to avoid DoS attacks.
+             2. Implement robust authentication (OAuth 2.0) for incoming request.
+             3. Use Role-Based Access Control (RBAC) for limit access to critical services.
+
+=> Archiving old data: 1. Implement a strategy to archive old data.
+                       2. Move outdated data(old delivery logs, notification content, user history) from main DB to low cost, longer term storage.
