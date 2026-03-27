@@ -1,0 +1,342 @@
+######### Functional Requirements ###################
+-----------------------------------------------------
+1. Users can upload photos and videos.
+2. Users can add caption to their posts.
+3. Users can like, share and comment on the posts.
+4. Support multiple images/videos in a single post.
+5. Users can Follow/Unfollow.
+6. Users can search by username or hashtag.
+7. Users can see a personalized feed of the posts from accounts they follow.
+
+
+######## Non Functional Requirements ##################
+-------------------------------------------------------
+1. Scalable: Handle millions of concurrent users and billions of posts.
+2. High Available: System should available 24/7 with minimal downtime.
+3. Eventual Consistency: Slight delay in seeing latest posts is acceptable.
+4. Low Latency: Feed should load fast (100ms).
+5. High Durability: Uploaded photos/videos should not be lost.
+
+
+############## Scale Estimation ########################
+--------------------------------------------------------
+
+=> Assumptions: 1. Daily Active Users(DAUs): 500 millions per day
+                2. Total monthly active users(MAUs): 2 billion
+                3. 20% of DAUs(100 million) uploads everyday. 
+                4. 80% are photos and 20% are videos.
+                5. Average photo size = 1 MB.
+                6. Average video size = 10 MB.
+                7. Average metadata size = 500 bytes.
+                7. Average Feed reads per user = 100 posts per day.
+
+=> Posts Uploads (Writes): 1. Each upload generates metadata in (DB + cache).
+                           2. (100 million uploads + 100 million metadata writes) = 200 million per day.
+
+=> Feed Reads: 1. (500 million DAUs * 100 posts) = 50 billion requests/day
+               2. Assuming 80% of feeds are from cache, So backend reads = 10 billion DB reads/day.
+
+=> Storage calculation: 1. Photos: (100 million post * 80%) * 1MB = 80 TB/day
+                        2. Videos: (100 million post * 20%) * 10MB = 200 TB/day
+                        3. Metadat upload per year: (100 million * 365) * 500 bytes = 18 TB/year.
+
+
+############### High Level Design #######################
+---------------------------------------------------------
+
+=> Client (Web/Mobile): 1. Client application handle video playback, user interactions (like, comment) and UI rendering. 
+                        2. They communicate backend service by API Gateway/Load balancer.
+
+=> Load Balancer/API Gateway: 1. Distribute traffic across multiple service instances for high availability and scalability.
+                              2. Enforce rate limiting, authentication and authorization before moving request forward.
+
+=> User Service: 1. Stores and manage authentication, profile data and social connections (follow/unfollow).
+
+=> Post Service: 1. Handles photo/video uploads and stores metadata (caption, userInfo, timestamp).
+                 2. Manage the upload of media files from user device to Object Storage (Amazon S3) and update metadat in DB.
+                 3. Uses a message queue (e.g Kafka) to notify the Feed Service for latest posts.
+
+=> Feed Service: 1. Precomputes and stores user feed in high-performance cache (Redis or Memcache) for fast retrieval.
+                 2. Query DB if feed is not cached.
+
+=> Engagement Service: 1. Manages likes, comments and shares.
+                       2. Writes engagement data to high-throughput database asynchronously via message queue.
+
+=> Search Service: 1. Allow user to search other users, hashtag, posts.
+                   2. Uses Elastic Search to index and retrieve data quickly.
+                   3. Support autocomplete or full-text data for better user experience.
+
+=> Message Queue: 1. Notify Feed service for new posts.
+                  2. Updates engagement data asynchronously.
+
+=> Object Storage and CDN: 1. Photos/Videos are stored in distributed object storage (Amazon S3, Google cloud storage).
+                           2. A CDN (Cloudflare, Amazon CloudFront) ensures fast delivery globally.
+
+
+################## Database Design #########################
+------------------------------------------------------------
+
+=> We use relational database (PostgreSQL, MySQL) for structured data and NoSQL DB (Cassandra, DynamoDB, Elastic Search) for feed storage and search indexing.
+
+=> Relational DB for structured data: 1. Users (user_id, username, full_name, email, profile_pic_url, password_hash, created_at).
+                                      2. Followers (follower_id, followee_id, engagement_score (Use for ranking feeds), created_at).
+                                      3. Posts (post_id, user_id, caption, like_count, created_at)
+                                      4. Media (media_id, post_id, media_type, media_url)
+                                      5. Comments (comment_id, post_id, user_id, content, created_at)
+                                      6. Shares (share_id, post_id, user_id, content, created_at)
+
+=> NoSQL DB for high volume data: 1. Relational DB struggle with high velocity writes and and large scale distributed workloads, So we use NoSQL DB for horizontal scalability and high availability.
+                                  2. To reduce feed generation latency, a denormalized feed table stores precomputed timelines.
+                                    {
+                                        "user_id": 56789,
+                                        "feed": [
+                                            {"post_id": 111, "user_id": 123, "media_url": "s3://path1", "caption": "Hello world"},
+                                            {"post_id": 112, "user_id": 234, "media_url": "s3://path2", "caption": "Sunset view"}
+                                        ]
+                                    }
+
+                                  3. Updated asynchronously via kafka when a user posts.
+                                  4. Cached in Redis for fast retrieval.
+                                  5. For complex relationship queries like mutual friends, suggested followers, and influencer ranking we use graph DB like Neo4j or Amazon Neptune.
+                                  6. It efficiently model follower-following relationships with nodes and edges.
+                                  7. For friend suggestion query.
+                                    MATCH (me:User {id:12345})-[:FOLLOWS]->(friend)-[:FOLLOWS]->(suggested)
+                                    WHERE NOT (me)-[:FOLLOWS]->(suggested)
+                                    RETURN suggested LIMIT 5
+
+=> Search Indexes: 1. For fast and scalable search queries, we use ElasticSearch, a distributed real time search engine for full-text searches.
+                   2. Each user profile and post metadata files stored as document in ES for advance filtering.
+                   3. User Data in ES:
+                    {
+                        "user_id": 12345,
+                        "username": "john_doe",
+                        "full_name": "John Doe",
+                        "bio": "Photographer | Traveler"
+                    }
+
+                   4. For trending hashtags and keyword searches, store hashtags as separate ES index.
+                    {
+                        "hashtag": "#travel",
+                        "post_count": 1500000,
+                        "last_used": "2025-03-20T12:00:00Z"
+                    }
+
+=> Media Storage: 1. Instagram handles petabytes of photos/videos, require a durable and low-latency storage.
+                  2. A distributed object storage like Amazon S3 is well suited, As it support pre-signed URLs which enable user for direct media upload without routing from server, reducing load and latency.
+                  3. For high durability, media files stores in multiple replicas in different data centers to avoid data loss.
+                  4. To optimize read latency, content cached near users in Content Delivery Network (CDN) like Cloudflare or Amazon CloudFront. 
+
+
+################## API Design ##############################
+------------------------------------------------------------
+
+=> Get User Profile: 1. GET /api/v1/users/{user_id}
+                     2. Authorization: Bearer JWT_TOKEN
+                     3. Response:
+                        {
+                            "user_id": 12345,
+                            "username": "john_doe",
+                            "full_name": "John Doe",
+                            "profile_pic": "https://cdn.example.com/profile.jpg",
+                            "followers_count": 200,
+                            "following_count": 150
+                        }
+
+=> Follow a User: 1. POST /api/v1/users/{user_id}/follow
+                  2. Authorization: Bearer JWT_TOKEN
+
+=> Create a Post: 1. POST /api/v1/posts
+                  2. Authorization: Bearer JWT_TOKEN, Content-Type: multipart/form-data
+                  3. Form Data:
+                    caption: "Sunset at the beach"
+                    media: [image1.jpg, video1.mp4]
+                  
+                  4. Response:
+                    {
+                        "post_id": 98765,
+                        "message": "Post uploaded successfully"
+                    }
+
+=> Get a Post By ID: 1. GET /api/v1/posts/{post_id}
+                     2. Response:
+                        {
+                            "post_id": 98765,
+                            "user_id": 12345,
+                            "caption": "Sunset at the beach",
+                            "media": [
+                                "https://cdn.example.com/photo1.jpg",
+                                "https://cdn.example.com/video1.mp4"
+                            ],
+                            "likes_count": 500,
+                            "comments_count": 120
+                        }
+
+=> Get User Feed: 1. GET /api/v1/feed?page=1&limit=10
+                  2. Authorization: Bearer JWT_TOKEN
+                  3. Response:
+                    [
+                        {
+                            "post_id": 123,
+                            "user": {
+                                "user_id": 56789,
+                                "username": "travel_lover"
+                            },
+                            "caption": "Exploring the mountains!",
+                            "media": ["https://cdn.example.com/photo123.jpg"],
+                            "likes_count": 1200,
+                            "comments_count": 85
+                        },
+                        {
+                            "post_id": 124,
+                            "user": {
+                                "user_id": 98765,
+                                "username": "foodie_dude"
+                            },
+                            "caption": "Delicious sushi!",
+                            "media": ["https://cdn.example.com/photo124.jpg"],
+                            "likes_count": 980
+                        }
+                    ]
+
+=> Like a Post: 1. POST /api/v1/posts/{post_id}/like
+                2. Authorization: Bearer JWT_TOKEN
+
+=> Comment on Post: 1. POST /api/v1/posts/{post_id}/comment
+                    2. Authorization: Bearer JWT_TOKEN, Content-Type: application/json
+                    3. {
+                         "content": "Amazing shot!"
+                       }
+
+=> Get Comments for a Post: 1. GET /api/v1/posts/{post_id}/comments?page=1&limit=10
+                            2. Response:
+                                [
+                                    {
+                                        "comment_id": 65432,
+                                        "user": {
+                                            "user_id": 12345,
+                                            "username": "john_doe"
+                                        },
+                                        "content": "Amazing shot!",
+                                        "created_at": "2025-03-18T12:34:56Z"
+                                    },
+                                    {
+                                        "comment_id": 65433,
+                                        "user": {
+                                            "user_id": 67890,
+                                            "username": "nature_lover"
+                                        },
+                                        "content": "Breathtaking view!"
+                                    }
+                                ]
+
+=> Search Users: 1. GET /api/v1/search/users?q=john
+                 2. Response:
+                    [
+                        {
+                            "user_id": 12345,
+                            "username": "john_doe",
+                            "full_name": "John Doe",
+                            "profile_pic": "https://cdn.example.com/profile.jpg"
+                        }
+                    ]
+
+################## Design Deep Dive ########################
+------------------------------------------------------------
+
+=> Photo/Video Upload: 1. User Initiates the upload.
+                            a. user select one or more photos and add caption.
+                            b. client send upload request to API gateway.
+                       2. API gateway handle the request.
+                            a. API gateway authenticate and validate the request.
+                            b. Route the request to post service.
+                       3. Post Service generates Pre-signed URL.
+                            a. Post service generate pre-signed URL from Object Storage (one per media).
+                            b. Send pre-signed URL to client.
+                       4. Client Uploads media to Object Storage.
+                            a. Client directly uploads each file in parallel to Object Storage using pre-signed URL.
+                            b. Once upload done, Client send confirmation to backend with all media URLs.
+                       5. Post Service Save metadata in the DB.
+                            a. Post Service stores metadata in Posts Table and stores each media file separately in Media table.
+                       6. Post service send event to kafka, notifying Feed service.
+
+=> Newsfeed Generation: 1. Fan-out-on-write (Push Model) for normal users.
+                            a. With limited followers, Posts are pushed to followers feeds at the time of posting.
+                            b. User A post new photo/video.
+                            c. Post Service notify Feed Service.
+                            d. Feed service identify user followers (eg 500).
+                            e. post is added to followers timeline, stored in redis (hot cache).
+                            f. When follower open the feed posts are available with low latency.
+                            g. Benefits: Fast reads as pre-computed feeds, works for small accounts.
+                            h. Challenges: Inefficient for miilion followers, write a post require copying million of timelines.
+                        
+                        2. Fan-out-on-read (Pull Model) for celebrities
+                            a. When user request newsfeed, Feed service dynamically retrieve normal user posts from redis (Precomputed) and celebrity posts from hot cache (Redis)  or a Persistent store (PostgreSQL).
+                            b. System merge both type of posts in real time.
+                            c. Benefit: Avoid massive write, Ensure Fresh data when user request feeds.
+                            d. Challenges: Slightly high read latency, Require caching optimization to reduce DB lookups.
+
+=> Search: 1. Indexing New Content.
+                a. User upload Post, Post/User metadata stores in DB, Post/User service publish event to kafka.
+                b. Search Service consume kafka event and add new user, post or hashtags to ES.
+           2. Search Request.
+                a. User type query in search bar, Client send request via API gateway to Search Service.
+                b. Search service first check cache otherwise ES, ES perform full-text search, prefix matching and ranking based on engagement/popularity.
+                c. ES return ranked results matching the query, then Search service formats the response.
+                d. Search service stores the frequent queries in redis, when user make same query the result is taken from redis.
+
+=> Like, Comments and Shares: 1. Engagement Service send kafka event to update DB asynchronously.
+                              2. Like Event:
+                                {
+                                    "event": "POST_LIKED",
+                                    "user_id": 12345,
+                                    "post_id": 67890
+                                }
+
+                              3. Share Event:
+                                {
+                                    "event": "POST_SHARED",
+                                    "user_id": 12345,
+                                    "post_id": 67890
+                                }
+
+                              4. Comment Event:
+                                {
+                                    "event": "POST_COMMENTED",
+                                    "user_id": 12345,
+                                    "post_id": 67890,
+                                    "comment_id": 99999,
+                                    "content": "Amazing shot!"
+                                }
+
+                              5. To optimize latency of popular posts, we cache like/share count and top comments.
+
+
+############## Addressing Scalability, Availability, Durability #############################
+---------------------------------------------------------------------------------------------
+
+=> Scalability: 1. Horizontal scaling 
+                    a. Add additional instances to manage increased load.
+                    b. Use Distributed databases (Cassandra, DynamoDB) to distribute data across nodes.
+
+                2. Sharding
+                    a. User Data shard by user_id
+                    b. Post Data shard by post_id
+                    c. Followers data shard by follower_id
+
+                3. Microservice Architecture
+                    a. Break system into multiple services like (Feed, Search, Post service etc).
+                    b. Use Message queue for high throughput operations asynchronously (like notification, feed generation, updates).
+
+=> Availability: 1. Platform must achieve atleast 99.99% availability.
+                 2. Maintain replicated DB across multiple region.
+                 3. Deploy multiple application servers across multiple availability zones (AZs).
+                 4. Use automatic failover in DB (leader-follower setup in PostgreSQL, multi-leader Cassandra cluster).
+                 5. Implement circuit breaker to gracefully degrade service if any dependency fails.
+
+=> Durability: 1. It means data (Photos/ videos etc) are never lost.
+               2. Store media in Amazon S3, which replicate data on multiple locations to prevent loss.
+               3. Replicate Db data for disaster recovery.
+               4. Prevent regular backups for accidental data loss.
+               5. implement Write-Ahead Logging (WAL) in databases to ensure changes are recorded before committing.
+               6. Use event sourcing to log user actions (like, comment, new posts) and rebuild state if necessary.
+             
