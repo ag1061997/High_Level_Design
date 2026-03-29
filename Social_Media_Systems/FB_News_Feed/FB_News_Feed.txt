@@ -1,0 +1,264 @@
+######### Functional Requirements ###################
+-----------------------------------------------------
+1. Users can create posts contains text, photos and videos.
+2. Users can Follow other users.
+3. Users can see a personalized feed of the posts from accounts they follow.
+4. Users can like/ comment on the posts.
+5. New posts should appear in user's feed in few seconds.
+6. System must handle users with heavy following like celebrity. 
+
+
+######## Non Functional Requirements ##################
+-------------------------------------------------------
+1. Scalable: Support high reads/writes and should scale horizontally.
+2. High Available: ensure availability (99.99%) even in high load and partial failure.
+3. Eventual Consistency: Slight delay in stale data (like count) is acceptable in favour of availability and performance.
+4. Low Latency: Feed should load fast (100ms) and new posts appear in feed within seconds.
+5. High Durability: Uploaded photos/videos, likes, comment should not be lost.
+
+
+########## Supporting Images and Videos ################
+--------------------------------------------------------
+
+=> Media in the data model: 1. Don't store media file in DB, only store its url in post metadata.
+                            2. Post table can store media_url or We can have Media table (media_id, post_id, media_type, media_url).
+                            3. Actual media stored in Amazon S3 or internal distributed file system and ideally served by CDN.
+
+=> How Media Upload Works: 1. Client request Post Service for upload url, Server deliver pre-signed url from Object storage provider and derive CDN accessible URL from storage path.
+                           2. Client directly upload media file using pre-signed URL.
+                           3. After upload client send create posts request, post service saves new post in DB with media_url.
+
+=> How media is delivered: 1. User fetch feed, server sends media_url in response.
+                           2. Photos/Videos are large and bandwidth intensive, So we use CDN (network of globally distributed servers that cache content near to user).
+                           3. Text/Metadata came from server and in parallel media fetch from nearest CDN node, it reduces latency.
+                           4. For optimization, photos can include thumbnail and videos can streamed with protocols like HLS/DASH which enable progressive playback and adaptive quality.
+
+
+#### Scaling Out - Service Separation and Database Sharding #####
+-----------------------------------------------------------------
+
+=> Microservice architecture: 1. Load Balancer/API Gateway.
+                                a. Accept and routes HTTP requests.
+                                b. Authenticate and ensure rate limiting.
+                                c. Forward request to appropriate backend server.
+
+                              2. User Service.
+                                a. Store user data in DB.
+                                b. Maintain follow graph in cache for fast access.
+                                c. Provide APIs: GET /users/{id}/followers, GET /users/{id}/followees.
+
+                              3. Post Service.
+                                a. Manage post creation and retrieval.
+                                b. Store post metadata in DB.
+                                c. Send post creation event to message queue.
+                                d. Provide APIs: POST /posts, GET /posts/{id}
+
+                              4. Feed Service.
+                                a. Generate and return user personalized feed.
+                                b. Reads from precomputed feed cache.
+                                c. Merges, ranks and return top N posts.
+                                d. Fetch Post and author metadata.
+
+                              5. Engagement Service.
+                                a. Manage likes and comments.
+                                b. Write engagement data (likes/comments) in DB.
+                                c. Updates counter in Post DB.
+                                d. Provide lightweight read APIs (hasLiked(user_id, post_id))
+
+                              6. Media Service.
+                                a. Manage upload and access to media files.
+                                b. Generate pre-signed URL for client upload.
+                                c. Return CDN accessible URL to be saved in posts.
+
+=> Database Design: 1. User DB:
+                        a. Relational DB (PostgreSQL)
+                        b. Stores user data and follow relationship.
+                        c. Follow table indexed and sharded by follower_id for efficient lookup.
+
+                    2. Post DB:
+                        a. Store post data.
+                        b. Sharded by author_id using consistent hashing.
+                        c. NoSQL DB like Cassandra are good for high write throughput and time based queries.
+                        d. Example Schema: {Table: Posts, Partition key: author_id, Clustering key: timestamp}
+                    
+                    3. Feed Cache:
+                        a. Store each user precomputed feed (list of post_ids).
+                        b. Implemented using Redis or another in-memory key value store.
+                        c. Enable O(1) feed fetch for active users.
+
+                    4. Likes and Comments DB:
+                        a. Likes are stored in key-value store or Relational DB, Like count for popular posts are stored in cache in Redis.
+                        b. For key-value store: post_id -> likes_count, user_id:post_id -> true/false (check if user like the post or not).
+                        c. Comments are write-heavy and read-paginated, So we use Shared SQL DB or document DB for flexible schema.
+                        d. Comment DB is shared by post_id, ensures writes are distributed and read (for one post) are served from single shard.
+                        e. Query: (SELECT * FROM Comments WHERE post_id = :post_id ORDER BY timestamp ASC LIMIT 20 OFFSET 0).
+                        f. For millions of comments on single post we use pagination.
+
+=> Scaling Techniques: 1. Horizontal Scaling.
+                        a. Each server is running on multiple instances, LB routes request to healthy instances.
+                        b. Services can be autoscaled based on CPU, memory or QPS.
+
+                       2. Database sharding.
+                        a. Large datasets are partitioned into multiple shards to handle load.
+                        b. Each shard has a primary-replica setup, writes on primary and Reads offloaded to replicas.
+
+                       3. Caching at multiple levels.
+                        a. Feed Cache: list of post_ids for user_id.
+                        b. Post cache: Full content of hot or viral posts.
+                        c. Like Count cache: post_id -> like_count (fast UI rendering)
+
+                       4. Asynchronous Processing.
+                        a. Non-blocking tasks are offloaded to background workers using message queue.
+                        b. Feed service consume event and put post in followers feed.
+                        c. Engagement service consume like/comment event and update count asynchronously.
+
+=> Each service is scalable, focused and independently deployble.
+=> DB is sharded to avoid bottleneck.
+=> Cache and async rocessing improve performance and responsiveness.                    
+
+
+###### Efficient Feed Generation - Push vs Pull Model ######
+------------------------------------------------------------
+
+=> Pull Model (Fan-out-on-read): 1. Feed is generated when user open app and ask for feed.
+                                 2. How it works:
+                                    a. Fetch the list of followee from user service.
+                                    b. Retrieve recent posts from each followee from Post service.
+                                    c. Merge and sort posts (by timestamp and ranking).
+                                    d. Return Top N posts to client and cache the result for short time.
+                                 3. Benefits:
+                                    a. Low latency on write.
+                                    b. Feed only generates if user is active.
+                                    c. Easier to implement as it relies on existing queries and indexes.
+                                 4. Drawbacks:
+                                    a. High read latency.
+                                    b. Scale poorly as 100M DAUs with 10 times fetch per day, 1 billion feed per day.
+                                    c. Delayed updates: New updates won't seen until next pull.
+                                 5. Good for low traffic and fewer followee, otherwise inefficient.
+
+=> Push Based Model (Fan-out-on-write): 1. When user create post, system add to its followers feed.
+                                        2. How it works:
+                                            a. User create post and Post service save in post DB.
+                                            b. Post service send event to kafka, Feed service consume event.
+                                            c. Feed service fetch list of the followers.
+                                            d. For each follower, add the post_id in feed cache or send the real-time update via web socket if follower is online.
+                                        3. Benefits:
+                                            a. Low read latency.
+                                            b. New posts appear immediately in feeds without manual refresh.
+                                        4. Drawbacks:
+                                            a. High write latency, if followers count is very high.
+                                            b. Wasted work for inactive follower.
+                                            c. Storage Complexity: storing 500 posts for 100M users is 50 billion feed requires careful sharding and eviction.
+                                            d. Consistency management: if user follow list changes, we need to update the feed content.
+                                        5. We have celebrity problem with millions of followers.
+
+=> The Hybrid model: Best of Both Worlds: 1. Push Model for regular users (followers under 10,000).
+                                          2. Pull Model for celebrity.
+                                          3. How it works:
+                                            a. Feed service use cache feeds for regular followee.
+                                            b. It fetched latest post on read for celebrity.
+
+=> Reading from Precomputed Feed: 1. Feed service fetch from feed cache.
+                                  2. Post details are fetched with metadata (text, media, author, like count) by bulk fetch from Post Service.
+                                  3. Feed is optionally ranked, sorted, returned.
+                                  4. Client render posts, fetch media directly from CDN.
+                                  5. To reduce latency, essential metadata stored in feed cache (author name, thumbnail url) and full content fetched if needed.
+
+=> Memory management at scale: 1. Feed size limit: 300-500 latest posts per user.
+                               2. Eviction Policy: Use LRU, TTL or time-based eviction.
+                               3. Prewarming: For frequent users, precompute the feed cache with usage pattern.
+                               4. For cold users, generate feeds on first access.
+                               5. If feed is missing, generate feed from latest posts of followees.
+                               6. 500 posts per user(1 kB each), for 100 million users -> 50TB of distributed cache.
+
+=> Avoiding duplicate Posts in feed: 1. Use a Last seen marker (Cursor based paging):
+                                        a. When client fetch feed (top 20), we put last_seen_post_id or timestamp marker.
+                                        b. Now on next request, client send after last_seen_post_id.
+                                        c. Query: {SELECT post_id FROM Feed WHERE user_id = :uid AND post_id > :after_id ORDER BY timestamp DESC LIMIT 20}.
+
+                                     2. Client-Side Deduplication:
+                                        a. Client maintain short term set of post_ids already seen.
+                                        b. When refresh again, it filter out these post_ids and merge new post_ids for infinite scroll and soft refresh.
+
+                                     3. Short-Term Cache On Server:
+                                        a. Server maintain session-level or time window seen_post_ids.
+                                        b. It filter out these post_ids on new refresh.
+                                     
+                                     4. Feed Entry Expiry + Freshness window
+                                        a. Limit feed stored in cache (500 posts).
+                                        b. Expire old entries after time window (3 days). 
+
+
+############# Real Time Updates and Notifications ##########
+------------------------------------------------------------
+
+=> To push updates from backend, we need persistent connections maintained by Real Time Service.
+
+=> WebSockets (Preferred Approach): 1. On Login, client create websocket connection with Real-Time Gateway.
+                                    2. Gateway maintain user-to-socket mapping in distributed cache (Redis) So it knows who are online and on which connection.
+                                    3. When a new post is added to user feed or like/comment is added, Relevant service publish event to Real Time Service.
+                                    4. Real Time Service push event to client over websocket.
+                                    5. Message Format Example: { "type": "new_post", "post_id": 12345 }, { "type": "notification", "message": "User B liked your post." }.
+
+=> Server Side Events (SSE): 1. Alternative to websocket, only support server -> client communication.
+                             2. Not suitable for 2-way communication.
+
+=> Long Polling (Fallback): 1. Used when websocket and SSE are not supported (old browsers).
+                            2. Client send request and wait for response, once server has data it responds and client reinitiate request.
+                            3. Less Efficient and High Latency.     
+
+################ Additional Considerations #################
+------------------------------------------------------------
+
+=> Ranking and Personalization: 1. Heuristic-Based Ranking (EdgeRank):
+                                    a. Rule based scoring formula: Score = Affinity × Weight × Decay.
+                                    b. Affinity: Closeness of viewer and author (past interactions).
+                                    c. Weight: Importance of post type (comment > like or video > photo).
+                                    d. Decay: Newer post score higher.
+                                
+                                2. Machine Learning Based-Ranking:
+                                    a. Modern social media use ML models trained on historic data like user behaviour to rank posts.
+                                    b. User post interaction history (similar content).
+                                    c. Engagements signals on post (like/comment).
+                                    d. Post metadata and freshness.
+                                    e. User pash behaviour (watch more video, skip text).
+
+                                3. Where Ranking fits in the Architecture:
+                                    a. Client request feed, routed to Feed Service from API Gateway.
+                                    b. Feed service fetch from feed cache.
+                                    c. It fetches post content, author, like/comments from other services.
+                                    d. The list of posts send to ranking Model (maybe machine learning (Inference Service) or heuristic model or stateless ranking service).
+                                    e. Posts are scored and sorted on relevance.
+                                    f. The top N posts are returned to client.
+
+                                4. Logging and Feedback for ranking improvement:
+                                    a. We log users behaviour and feedback like posts are clicked, time spent, user like/comment the posts.
+                                    b. This data helps to train ML models, Refine ranking algo, Run A/B test to compare different ranking strategies.
+                                    c. Client → Kafka → Streaming/Batch Processing (e.g., Spark, Flink) → Data Lake → Feature Store → Model Training.
+                                    d. Logs feed into ML training pipeline and improved model deployed to Inferance Service.
+
+=> High Availability and Fault Tolerance: 1. Redundancy Across All Layers:
+                                            a. All services runs with multiple replicas if one fail traffic is rerouted.
+                                            b. Data is replicated, if primary fail replica is promoted.
+                                            c. In-memory stores like Redis runs in clustered mode with failover support.
+                                            d. Kafka replicate logs across brokers.
+
+                                          2. Multi-Region Deployment:
+                                            a. We deploy across different regions (US, Europe).
+                                            b. Active-Passive Model: Standby region is kept in sync in case of outrage.
+                                            c. Active-Active Model: All region serve traffic, user routed to nearest region.
+                                            e. In active-active model, data is shared by region and cross-region relationships are supported by async replication.
+
+                                          3. Circuit Breaker and Timeout:
+                                            a. Use circuit breaker pattern to detect and isolate failure (ex if ranking service is down then feed service will not send request and serve default feed).
+                                            b. Set timeout for all inter-service calls, if service take long time then pipeline must not block.
+
+                                          4. Graceful Degradation:
+                                            a. If non-critical service fail, the rest should work.
+                                            b. if comment service fail, feed service must work but may show "comments are not available".
+                                            c. If real-time-update fail, user fallback to manual refresh.
+
+                                          5. Data Backup and Recovery;
+                                            a. Backup posts, follow, like/comment in cold storage (S3, GCS).
+                                            b. Use snapshots or write-ahead-logs for point-in-time recovery.
+                                            c. Use multi region replication for additional durability.
