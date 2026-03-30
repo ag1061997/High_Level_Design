@@ -1,0 +1,307 @@
+########### Functional Requirements ###################
+-------------------------------------------------------
+1. Given a long URL, generate a unique short URL.
+2. Allow user to create custom short codes (if available).
+3. When short URL is clicked redirect to long URL.
+4. Track basic click count of short URL.
+5. Support link expiration with default and custom TTLs.
+
+
+######## Non Functional Requirements ##################
+-------------------------------------------------------
+1. Scalable: Handle large number of read/write request (100:1 is read-write ratio).
+2. High Available: System should available for 99.99%.
+3. Uniqueness: Each long URL map to unique short URL.
+4. Low Latency: Redirect request complete in 50ms.
+5. High Durability: Once short URL is created mapping should not be lost.
+
+
+############## Scale Estimation ########################
+--------------------------------------------------------
+
+=> Assumptions: 1. 10 million new link created per day.
+                2. with 100:1 read/write ratio, 1 billion read per day.   
+
+=> URL shortening (Writes): 1. Avg QPS: 10 million / (24 * 3600) = 115 QPS
+                           2. Peak QPS (3 times) : 115 * 3 ~ 350 QPS 
+
+=> URL Redirect (Reads): 1. Avg QPS: 1 billion / (24 * 3600) = 11,500 QPS
+                           2. Peak QPS (3 times) : 11,500 * 3 ~ 35,000 QPS 
+
+=> Storage calculation: 1. Short Url: 7 bytes, long url: 200 bytes, user_id: 36 bytes, Timestamp/metadata: 50 bytes, Total: 300 bytes per url.
+                        2. 5 year storage: (5 * 10 million * 365 * 300 bytes) = 5.5 TB
+                        3. Short Code Length:
+                            a. Base62Encoding (a-z, A-Z, 0-9)
+                            b. 6 character: 62^6 = 56.8 billion unique codes.
+                            c. 7 character: 62^7 = 3.5 trillion unique codes.
+
+
+#################### Core APIs ##########################
+---------------------------------------------------------
+
+=> Create Short URL: 1. POST /shorten
+                     2. Request:
+                        {
+                            "long_url": "https://example.com/url/that/needs/shortening",
+                            "custom_alias": "",                                           // alias if provided need unique check
+                            "expiry_date": "2024-12-31T23:59:59Z",                        // timestamp when short link expire if provided
+                            "user_id": "user123"
+                        }
+
+                     3. Response:
+                        {
+                            "short_url": "http://short.url/abC123",
+                            "long_url": "https://example.com/very/long/url/that/needs/shortening",
+                            "expiry_date": "2024-12-31T23:59:59Z",
+                            "created_at": "2024-08-10T10:30:00Z"
+                        }
+                     
+                     4. Error Codes: (409 custom alias already exist), (400 URL is invalid), (401 user is not authorised).
+
+=> Redirect to Long URL: 1. GET /{short_code}
+                         2. Response: (301 used when short link is permanent), (302 when temporary redirect happen).
+                         3. If link is active, return HTTP redirect, if expired return 410 Gone, if not exist return 404 Not Found.
+
+=> Get URL Analytics: 1. GET /analytics/{short_code}
+                      2. Fetch click statistics.
+                      3. Response:
+                        {
+                            "short_code": "abc123",
+                            "total_clicks": 15420,
+                            "created_at": "2025-01-15T10:30:00Z",
+                            "last_accessed": "2025-01-20T14:22:00Z"
+                        }
+
+
+################## High Level Design #######################
+------------------------------------------------------------
+
+=>  URL Shortening: 1. Clients:
+                        a. Client interact with internal systems via APIs.
+
+                    2. Load Balancer:
+                        a. Distribute traffic on multiple application servers.
+                        b. Ensure high availability and fault tolerance, if one server fails.
+                        c. Can perform SSL termination and request filtering (rate limiting).
+
+                    3. URL Generation Service:
+                        a. Handles all write operations, manage and create new short URLs.
+                        b. Validate the request and generate unique short urls.
+                        c. Handle custom aliases given by user.
+                        d. Storing metadata like expiry time, creation time, user_id.
+                        e. This service doesn't need much scaling.
+
+                    4. Redirection Service:
+                        a. It handle GET request, it needs to be horizontal scalable, ultra-fast.
+                        b. Look long url for the given short code.
+                        c. Check if link is valid.
+                        d. Return HTTP 301 (Permanent) or 302 (Temporary) redirection response.
+                        e. Cache frequent mapping access to reduce load on DB.
+                        f. It focus on low latency, caching efficiency and high read throughput.
+
+                    5. Database:
+                        a. High read throughput to sustain redirect traffic.
+                        b. Write durability to avoid data loss.
+
+                    6. API Flow:
+                        a. Client send API request: POST /api/v1/shorten
+                        b. Load Balancer reroute request to URL Shortening Service.
+                        c. URL Shortening service validate URL and generate unique short code.
+                        d. The service store mapping in DB.
+                        e. The service return the short url to client.
+
+=> URL Redirection: 1. Cache Layer (Redis)
+                        a. For 50ms latency with 35,000 QPS, we need distributed cache.
+                        b. It store frequently accessed URL mapping and reduce load on DB.
+                        c. Provide sub-millisecond lookup time.
+
+                    2. API Flow:
+                        a. Client request: GET /abc123.
+                        b. Load Balancer reroute request to Redirection Service.
+                        c. First service check redis cache if found return URL immediately otherwise check main DB.
+                        d. Service validate link is not expired.
+                        e. Return HTTP 302 redirect to original URL.
+
+
+################## Database Schema #########################
+------------------------------------------------------------
+
+=> A NoSQL DB like Cassandra or DynamoDB is better to efficiently handle billions of key-value lookups and provide high scalability and availability.
+
+=> User Table: 1. Store user related info for personalization, analytics, management.
+               2. User (user_id, email, created_at, api_key).
+
+=> URL Table: 1. URL Mapping (short_code, long_url, user_id, expiry_time, created_at, click_count, is_custom).
+              2. Primary key on short_code for fast lookups, Secondary key on user_id to check list of links for user.
+
+################## Design Deep Dive ########################
+------------------------------------------------------------
+
+=> Unique URL Generation:
+    => Hashing + Encoding (Deterministic): 1. Use cryptographic hash function to add a unique fingerprinton long URL, then encode it into compact URL-safe string.
+                                           2. Canonicalize the URL:
+                                            a. Before hash, URL must be standarized to avoid getting multiple short URLs.
+                                            b. Ex. {https://Example.com/, https://example.com} they must not have different short url.
+                                            c. Convert domain to lowercase, Remove default ports, Normalize trailing slashes, Remove unnecessary query params.
+
+                                           3. Generate a Hash:
+                                            a. Apply cryptographic hash function like SHA-256, SHA-1 or MD5 to Canonicalized URL.
+                                            b. It give fixed length fingerprint (128 bits for MD5, 256 bits for SHA-256).
+
+                                           4. Truncate and Encode:
+                                            a. User send request of long_url, MD5 hash convert the url to 128 bits hash or 32 character hexadecimal code.
+                                            b. For short code we took only 6 bytes of hash -> 12 characters.
+                                            c. Convert these 6 bytes hexadecimal to decimal.
+                                            d. Encode the decimal into Base62 encoded string, we choose 6 bytes as this approximately give the result of around 7 characters.
+                                            e. It is deterministic, as it always short URL is always same for long URL.
+                                            f. We can detect duplicate easily, multiple servers can generate code independently.
+                                           
+                                           5. Collision Risks:
+                                            a. Hash collision are possible as we truncate the hash.
+                                            b. Add some salt in long url and hash again (long_url + salt), repeat till unique code doesn't appear.
+                                            c. Attach small counter or suffix to short code (abc -> abc-1 -> abc-2).
+                                            d. Both solution negate stateless benefit as atleast one lookup DB required, added complexity, high latency.
+
+    => Global Counter (Non-Deterministic): 1. It relies on global monotonically increasing counter to ensure every short code is unique.
+                                           2. The centralized counter service increase the integer counter and never repeat.
+                                           3. Request a unique ID:
+                                            a. When request came, it contact counter service implemented as fast in-memory store like redis.
+                                            b. When we increament counter, redis put lock on key, increment value, return new value, unlock key.
+                                            c. It ensure no two server get same counter in extreme concurrency.
+
+                                           4. Encode the ID:
+                                            a. Then encode the counter into Base62 short code.
+                                            b. Even after billion of short URLs, length will not exceed 6-7 characters.
+
+                                           5. Pros: Uniqueness, one operation increament so low latency in redis, short code grow in logarithmic way when total urls increase.
+                                           6. Cons: Every request went to counter service (Redis) through is limited by counter network and CPU, Counter service is single point of failure, IDs are sequential so they are predictable.
+
+                                           8. Sharded Counter:
+                                            a. Deploy multiple counters (1024 counter), Now Each id combine shared ID + local counter value.
+                                            b. global_id = (sharded_id << 20) | local counter, each shard give 1 million IDs.
+                                            c. Remove SPOF, enable horizontal scaling, uniqueness if shard id is unique.
+
+                                           9. ID Obfuscation:
+                                            a. To prevent sequential ID from being decoded, we shuffle bits with Feistel cipher or XOR mask.
+                                            b. We can still decode the IDs, It produce random short codes which add privacy without any effect on performance.
+
+    => Distributed ID generator: 1. Each ID is 64 bits which is unique across thousand of machines.
+                                 2. Timestamp (41 bits), Worker ID (10 bits), Sequence (12 bits).
+
+                                 3. Timestamp: Number of milliseconds from any custom epoch, 41 bits timestamp -> 2^41 -> 69.7 years.
+                                 4. Worker ID:
+                                    a. Each worker (server instance) get a unique ID at startup.
+                                    b. 10 bits -> 1024 workers per cluster.
+                                    c. When any worker start and connect to coordination service like zookeeper, it register itself and request unique ID.
+                                
+                                 5. Sequence Number:
+                                    a. It is local in memory counter that tracks how many IDs worker generates within same millisecond.
+                                    b. 12 bits -> 2^12 -> 4096 IDs per millisecond per worker.
+
+                                 6. Pros:
+                                    a. Highly scalable and available: Id generation is decentralized, we can add new workers and if any worker fail the other worker will continue.
+                                    b. IDs are monotonically increasing, when they used as primary key new insert is near the end of index and it is highly efficient for range queries.
+                                    c. ID are generated in-memory So no network hops, Low latency.
+
+                                 6. Cons:
+                                    a. Clock Synchronization required, if worker clock drift backward it might produce same ID.
+                                    b. System require reliable coordination service (zookeeper) to manage worker IDs and clock synchronization across all server like NTP or cloud time service.
+
+=> Fast URL Redirections: 1. Choosing the Right Redirect Code:
+                            a. Choice between 301, 302, 307 affect both speed and control.
+                            b. 301 (Moved Permanently): tell browser to cache the URL and never ask the backend for redirection, it is fast but we on longer update destination URL and check click count.
+                            c. 302/307 (Temporary Redirect) Preferred/Default: Browser contact service on every click, we can update, expire or check click count but slight high latency. 
+
+                          2. Read Path:
+                            a. First we check browser, if 301 is used then it will be found and request never reach server.
+                            b. We check in CDN, if cache hit then return with 302 code, else forward the request to origin server.
+                            c. First we check in-memory cache (key: short code, value: long_url), if cache hit then return the result and CDN will cache this result otherwise check DB.
+                            d. DB has mapping of short_url with long_url, So for key-value read NoSQL like Cassandra, DynameDB, ScyllaDB are best.
+                            e. Query: {SELECT long_url FROM url_mapping WHERE short_code = 'xyz';}.
+                            f. Then we store result in redis cache for future use, return 302 response to CDN which caches it.
+
+=> Supporting Custom Aliases: 1. It is valuable for marketing campaign, social media sharing, brand consistency etc.
+                              2. API Design: Request with custom_alias.
+                                    {
+                                        "long_url": "https://www.my-ecommerce-store.com/products/summer-collection-2025",
+                                        "custom_alias": "summer-sale",
+                                        "expires_at": "2025-09-01T23:59:59Z"
+                                    }
+
+                              3. Rigorous Validation:
+                                a. Before creating custom alias, system do validation to prevent misuse, conflict, routing error.
+                                b. Alias must contain URL-safe characters like ^[a-zA-Z0-9_-]+$
+                                c. Enforce minimum and maximum length (3-50).
+                                d. Reserved words like /api, /login, /help, /contact, /admin must be blocked to prevent user from hijacking critical application path.
+                                e. All check occur before DB operations.
+
+                              4. Ensuring Uniqueness and handling race condition:
+                                a. Two user use same alias at same time and check this alias is free.
+                                b. First user insert entry, now if other put entry it will fail or create duplicate.
+                                c. Database should have unique contraint on the alias column.
+                                d. Query: {CREATE TABLE url_mapping (short_code VARCHAR(10) PRIMARY KEY, alias VARCHAR(50) UNIQUE, long_url TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);}.
+
+=> Supporting Link Expiration: 1. It is used in marketing campaign, security use cases like password reset, system maintenance to prevent infinite data growth.
+                               2. Active Deletion (Background Job):
+                                a. Scheduled worker process periodically (every hour) scan expired links and delete them.
+                                b. DELETE FROM links WHERE expires_at < NOW();
+                                c. Pros: Reducing storage cost, Fewer stale entries mean faster queries.
+                                d. Cons: Scanning large table frequently burden the DB, Link might be active after expiration till job is executed, Require to maintain reliable scalable background worker.
+
+                               3. Passive Expiration (Real-Time Check):
+                                a. Link is never deleted, service only check expiration time.
+                                b. if link.expires_at < current_time:
+                                        return "Link expired"
+                                    else:
+                                        redirect_to(link.long_url)
+                                c. Pros: No additional background job, timestamp comparison add 0 latency, link is inactive at exact moment.
+                                d. Cons: Consuming storage, Expired link still in dataset unless filtered.
+
+                               4. Recommended Hybrid Approach:
+                                a. Passive Expiration on read path.
+                                b. Run low frequency background job like weekly or monthly to delete long expired links.
+                            
+                               5. Caching and Expiration Consistency:
+                                a. TTL_cache = min(link.remaining_lifetime, default_cache_ttl)
+                                b. This ensure TTL align with link lifetime to prevent expired links from redirection.
+
+=> Analytics - Click Count: 1. It helps to check which campaign perform best or where when traffic originate.
+                            2. What is click:
+                                a. Only successful redirection count (301/302).
+                                b. Expired, Invalid results are not counted.
+                                c. Repeated request from same user in small time window is ignored.
+                            
+                            3. Click Logging Flow:
+                                a. User is redirected. (synchronously).
+                                b. System record the click count. (asynchronously).
+
+                            4. Direct Increment (Simple for Low Scale)
+                                a. UPDATE links SET click_count = click_count + 1 WHERE short_code = 'abc123';
+                                b. Pros: Simple and easy, count is always up to date.
+                                c. Cons: Write heavy to DB, row-level contention on high concurrency.
+
+                            5. Buffered Counting (Recommended for Scale)
+                                a. Increment count in cache and periodically flush the count in DB, then reset counter in cache.
+                                b. Pros: Reduce DB write, Cache is fast and atomic, handle high concurrency.
+                                c. Cons: Count lag in real-time (depend on flush time).
+
+                            6. Event Streaming (For Real-Time Analytics):
+                                a. Large scale systems like Bitly or Google Analytics use event driven pipeline.
+                                b. Redirect Service -> Kafka/Kinesis -> Flink/Spark Streaming -> ClickHouse/Cassandra/Druid -> Analytics dashboard.
+                                c. Kafka: message ingestion, Flink: aggregation, ClickHouse: analytics storage.
+                                d. Pros: Real-time analytics, horizontal scaling with billions of events.
+                                e. Cons: High complexity and cost, Need Streaming infrastructure.
+
+=> Handling high availability: 1. Multi Region Deployment:
+                                a. Primary region handle all writes.
+                                b. Each region has read replica of DB.
+                                c. User is routed to nearest region using latency-based DNS.
+
+                               2. Database Replication:
+                                a. For DynamoDB, enable global tables for automatic multi region replication.
+                                b. For Cassandra, configure relication factor to 3, Use LOCAL_QUORUM for reads to ensure consistency in region.
+
+                               3. Graceful Degradation:
+                                a. Serve from cache (read continue working).
+                                b. Queue write for retry.
+                                c. Return cache stale data instead of error.
