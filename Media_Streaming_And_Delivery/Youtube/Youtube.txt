@@ -1,0 +1,314 @@
+########### Functional Requirements ###################
+-------------------------------------------------------
+1. User upload video files.
+2. User stream video with adaptive bitrate streaming to adjust quality based on network.
+3. User create and subscribe channel.
+4. User can like/comment video.
+5. User can search videos.
+6. Uploaded video must be transcoded to multiple resolutions (240p, 360p etc) to support different network condition.
+
+
+######## Non Functional Requirements ##################
+-------------------------------------------------------
+1. Scalable: System support millions of concurrent users and thousand of videos upload per min.
+2. High Available: Video upload, playback, search should have minimum downtime.
+3. Low Latency: Low latency on search and fast video streaming with minimum buffering.
+4. High Durability: Video files must be stored reliably to avoid data loss.
+5. Optimize Storage and bandwidth cost.
+
+
+############## Scale Estimation ########################
+--------------------------------------------------------
+
+=> Assumptions: 1. 10 million DAUs.
+                2. Upload Rate: 100,000 videos/Day.
+                3. Average video watch per user per day: 5 videos.
+                4. Average Video Size: 500 MB.
+                5. Video Metadata size: 1 KB.
+
+=> Storage Estimation: 1. 100,000 * 500MB = 50 TB per day
+                       2. Metadata storage: 100,000 * 1KB = 100MB per day
+
+=> Network Bandwidth Estimation: 1. Daily video consumption: 5 * 10 million = 50 million videos/day.
+                                 2. Daily bandwidth consumption: 50 million * 500MB = 25 PB/day.
+
+=> Due to high storage and bandwidth, cloud services are best.
+=> CDN for storing frequent videos near user and Amazon S3 for storing video files.
+
+
+################# High Level Design #####################
+---------------------------------------------------------
+
+=> Video Streaming Architecture: 1. Client:
+                                    a. Client handle video playback, interaction (like/comment), UI rendering.
+                                    b. Client send request to backend by LB or API gateway.
+
+                                 2. Load Balancer/API Gateway:
+                                    a. Distribute traffic across multiple instances.
+                                    b. Authenticate, Rate limit, Authorize before moving request forward.
+
+                                 3. Video Metadata Service:
+                                    a. Store and Manage metadata (author_id, upload_time, description, tag).
+                                    b. Expose APIs to update video metadata.
+                                    c. Use relational SQL (MySQL/PostgreSQL) for structured data and use cache for storing frequent video queries.
+
+                                 4. Content Delivery Network (CDN):
+                                    a. Cache and serve video segment from nearby nodes.
+                                    b. Reduce load and bandwidth from original storage.
+
+                                 5. Video Streaming Flow:
+                                    a. User click on the video thumbnail.
+                                    b. Client send the request to Video Metadata service by API gateway, Streaming manifest URL (HLS .m3u8 or DASH .mpd file) stored in CDN.
+                                    c. Video Player download the manifest file, It cantains the link of video segemnts in different resolutions which allow adaptive streaming based on internet speed.
+                                    d. CDN serve video content from edge server near to user for low latency and bandwidth.
+                                    e. Video begin playing and player continuously fetch small chunks of video from CDN.
+                                    f. If any chunk is not present in CDN, it is fetched from DB and stored in cache for future use and serve user in real time.
+
+=> Video Upload and Processing Architecture: 1. Video Upload Service:
+                                                a. Handle video upload, often use multi-part upload for large files.
+                                                b. Generate pre-signed URL for direct upload to Object storage (Amazon S3) from client device.
+                                                c. Create entry in DB for video metadata, once video upload is initiated.
+                                                d. Send Transcoding job to message queue after successful upload.
+
+                                             2. Video Transcoding Service:
+                                                a. Read raw video files from Blob storage and encode it to different resolutions for adaptive streaming.
+                                                b. Generate video thumbnail and extracts metadata.
+                                                c. Stores transcoded videos in Object Storage and CDN-backed storage.
+
+                                             3. Message Queue:
+                                                a. Decouple Upload service from transcoding service for scalability.
+                                                b. Stores job request from Upload Service and Transcode them asynchronously.
+
+                                             4. Storage:
+                                                a. Store structured metadata in Relational DB.
+                                                b. Store Unprocessed raw video file in blob storage before transcoding.
+                                                c. Store transcoded video-segments in CDN-backed stores.
+
+                                             5. Video Upload Flow:
+                                                a. Client select video file and send upload request to Video Upload Service with metadata (author, description, channel_id, tags).
+                                                b. Video Upload Service generate pre-signed URL and Client upload file to Object Storage using pre-signed URL.
+                                                c. Large files also use multi-part upload, where client convert big file into small chunks and then upload.
+                                                d. Even if connection fail, Client only need to upload remaining chunks and Client can also upload chunks concurrently with multiple threads.
+                                                e. Upload service create new entry in metadata DB (video_id, channel_id, description, status, upload_time, tag, raw_file_upload_url) and send response to client with video_id.
+                                                f. Upload servide send message to queue (Kafka, Amazon SQS, RabbitMQ) with info like video_id, raw_file_upload_url, target_format, target_resolutions.
+
+                                             6. Video Transcoding Flow:
+                                                a. Transcoding Service consume the message and download video file from raw_file_upload_url.
+                                                b. It uses video processing tools (FFmpeg) to create adaptive bitrate variants like 240p, 360p, 480p, 720p etc.
+                                                c. Each variants is split into small chunks (2-10 seconds).
+                                                d. It finaly writes video segments and streaming manifest file in transcoded folder of blob Object Storage or CDN-backed storage path.
+                                                e. It also create thumbnail by capturing a frame at the X second.
+                                                f. Once transcoding finished, it send API request to Video upload service to update metadata like status, thumbnail_url, transcoded_url.
+                                                g. Once transcoded file are stored in Object Storage, CDN automatically stores content in edge node for future request and reduce latency and bandwidth.
+                                                
+
+#################### Database Design #######################
+------------------------------------------------------------
+
+=> We use NoSQL DB for high volume event logs and caching frequently used data.
+
+=> We use Blob storage for video files.
+
+=> Relational Database: 1. Use PostgreSQL or MySQL for metadata, subscription, relationships.
+                         2. Users: store user data {user_id, username, email, profile_pic_url, country, hashed_password, created_at}.
+                         3. Videos: Store video metadata {video_id, channel_id, title, description, tag, visibility, status, duration, upload_date, like_count, view_count, raw_file_url, thumbnail_url, resolutions_url}.
+                         4. Channels: Each user can have one or more channels {channel_id, user_id, channel_name, description, subscriber_count, created_at}.
+                         5. Subscriptions: Track User subscription to channel {user_id, channel_id, subscribed_at}.
+                         6. Comments: Store video comments {comment_id, video_id, user_id, content, created_at}.
+                         7. Resolutions URL JSON format:
+                            {
+                                "240p": "https://cdn.provider.com/videos/12345/240p.m3u8",
+                                "480p": "https://cdn.provider.com/videos/12345/480p.m3u8",
+                                "720p": "https://cdn.provider.com/videos/12345/720p.m3u8",
+                                "1080p": "https://cdn.provider.com/videos/12345/1080p.m3u8"
+                            }
+
+=> Search Index: 1. For fast video search, we store video metadata in ElasticSearch.
+                 2. {
+                        "video_id": 12345,
+                        "title": "Learn System Design",
+                        "description": "This is an in-depth guide...",
+                        "tags": ["system design", "architecture", "scalability"],
+                        "views": 500000,
+                        "upload_date": "2025-01-30T10:15:00Z"
+                    }                
+
+
+##################### API Design ###########################
+------------------------------------------------------------
+
+=> Video Upload And Processing API: 1. Initiate Video Upload:
+                                        a. POST /videos/upload, Authorization: Bearer jwt_token
+                                        b. Request (JSON or Multipart/form-data):
+                                            {
+                                                "channel_id": 45678,
+                                                "title": "How to Learn System Design",
+                                                "description": "A complete guide to mastering system design",
+                                                "tags": ["system design", "architecture", "scalability"]
+                                            }
+                                        c. Response:
+                                            {
+                                                "video_id": 456,
+                                                "status": "processing",
+                                                "upload_url": "https://s3.example.com/upload/456.mp4"
+                                            }
+                                    
+                                    2. Complete Upload And Start Processing:
+                                        a. POST /videos/{video_id}/process, Authorization: Bearer jwt_token
+                                        b. Response:
+                                            {
+                                                "message": "Video processing started."
+                                            }
+
+=> Video Metadata And Streaming APIs: 1. Get Video Details: 
+                                        a. GET /videos/{video_id}
+                                        b. Response:
+                                            {
+                                                "video_id": 456,
+                                                "title": "How to Learn System Design",
+                                                "description": "A complete guide to mastering system design",
+                                                "category": "Education",
+                                                "tags": ["system design", "architecture", "scalability"],
+                                                "views_count": 150000,
+                                                "likes_count": 1200,
+                                                "comments_count": 300,
+                                                "upload_date": "2025-01-30T10:15:00Z",
+                                                "status": "live",
+                                                "thumbnail_url": "https://cdn.example.com/thumbnails/456.jpg",
+                                                "resolution_urls": {
+                                                    "240p": "https://cdn.example.com/videos/456/240p.m3u8",
+                                                    "480p": "https://cdn.example.com/videos/456/480p.m3u8",
+                                                    "720p": "https://cdn.example.com/videos/456/720p.m3u8"
+                                                }
+                                            }
+                                    
+                                      2. Stream Video (HLS/DASH)
+                                        a. GET /videos/{video_id}/stream
+                                        b. Response: Redirect to CDN for HLS/DASH manifest file.
+
+=> Search APIs: 1. Search Video:
+                    a. GET /search?query=system+design&limit=10&offset=0&sort=views
+                    b. Response:
+                        {
+                            "results": [
+                                {
+                                    "video_id": 456,
+                                    "title": "How to Learn System Design",
+                                    "description": "A complete guide to mastering system design",
+                                    "thumbnail_url": "https://cdn.example.com/thumbnails/456.jpg",
+                                    "channel_id": 45678,
+                                    "view_count": 150000,
+                                },
+                                ...
+                            ],
+                        }
+
+=> Engagements APIs: 1. Like a Video: POST /videos/{video_id}/like, Authorization: Bearer jwt_token
+                     2. Comment on a Video:
+                        a. POST /videos/{video_id}/comments, Authorization: Bearer jwt_token
+                        b. Request:
+                            {
+                                "content": "Great video! Very informative."
+                            }
+                        c. Response:
+                            {
+                                "comment_id": 987,
+                                "message": "Comment added successfully."
+                            }
+
+                     3. Get Comments on a video:
+                        a. GET /videos/{video_id}/comments?limit=10&offset=0
+                        b. Response:
+                            {
+                                "comments": [
+                                    {
+                                        "comment_id": 987,
+                                        "user": "john_doe",
+                                        "content": "Great video! Very informative.",
+                                        "created_at": "2025-01-30T10:30:00Z"
+                                    }
+                                ]
+                            }
+
+################## Design Deep Dive ########################
+------------------------------------------------------------
+
+=> Video Transcoding: 1. Uploading and Storing Raw File:
+                        a. User upload raw video file (mp4, mov, AVI), then file is uploaded to Object Storage.
+                        b. Metadata is stored in DB.
+                      
+                      2. Job Dispatching via Message Queue:
+                        a. Upload service send message to queue, Transcoded service consume message and process asynchronously.
+                        b. Target format are HLS (HTTP Live Streaming), DASH (Dynamic Adaptive Streaming over HTTP), two widely used protocols.
+                        c. Message Request:
+                            {
+                                "video_id": 456,
+                                "raw_file_url": "s3://video-uploads/12345.mp4",
+                                "target_resolutions": ["240p", "480p", "720p", "1080p"],
+                                "target_formats": ["HLS", "DASH"]
+                            }
+                    
+                      3. Decoding raw file:
+                        a. Video file split into multiple segments by tools like FFmpeg.
+                        b. Each segment is transcoded parallely into multiple formats using multiple FFmpeg instances on worker node.
+
+                      4. Encoding into multiple resolutions:
+                        a. Each video is encoded into multiple resolutions and master manifest file refrences these resolutions.
+
+                      5. Generating Video Segments For streaming:
+                        a. Short segemnts allow quick adaptation, if network changes in mid of video stream the next segement can be requested with different resolution with minimal playback disruption.
+
+                      6. Generating Thumbnail:  
+                       a. Thumbnail is created as a preview, user can update thumbnail manually.
+
+                      7. Storing Transcoded files in Object Storage:
+                        a. transcoded videos, manifest files, thumbnail are stored in object storage.
+                        b. s3://video-platform/videos/12345/240p.m3u8, s3://video-platform/videos/12345/480p.m3u8, s3://video-platform/videos/12345/thumbnail.jpg 
+
+                      8. Updating the DB and CDN:
+                        a. Metadata is updated with thumbnail_url, transcoded_url, status and CDN cache video segments for low latency.
+
+=> Video Streaming: 1. User click on video thumbnail or open video page.
+                    2. Client send the request to Video Metadata service by API gateway, Streaming manifest URL (HLS .m3u8 or DASH .mpd file) stored in CDN.
+                    3. Video Player download the manifest file from CDN, It cantains the link of video segemnts in different resolutions which allow adaptive streaming based on internet speed.
+                    4. Video player chooses initial bitrate and download first segement, monitor download speed and buffer level to update the resolution.
+                    5. Player continuously request segments and buffer data to render frames in real-time.
+                    6. When playback conclude or user move timeline forward, player calculate which segment to request next and start same segment download process.
+
+=> Video Search: 1. Transform Metadata to structure optimized for fast retrieval.
+                 2. Understand user queries with keyword or NLP based improvements.
+                 3. Use Ranking/Scoring for relevant videos for user based on likes, views, user preference.
+                 4. Architecture And Components:
+                    a. When video is uploaded system pushes the metadata to Search Indexing Service (ElasticSearch), it is asynchronous and might be slight delay in upload and search result.
+                    b. Inverted Index: Each word map to list of video_Ids where it appear.
+                    c. Search Service queries with inverted index with relevant filters (language, upload_date).
+                    d. Scoring/Ranking algorithm sort the result with relevance.
+
+
+######## Addressing Non-Functional Requirements ############
+------------------------------------------------------------
+
+=> Scalability: 1. Horizontal Scalable: we use microservice architecture with multiple instances of services.
+                2. Metadata Sharding:
+                    a. Shard metadata by video_id to distribute load on multiple instances.
+                    b. Lookup service maintain mapping of video_id and shard, Before fetching metadata client query to lookup service.
+                    c. Use Cache to reduce load on DB.
+
+                3. Distributed and Parallel Transcoding:
+                    a. Split video into multiple segments and distribute them on multiple workers.
+                    b. Merge the transcoded segments into single file.
+
+=> Availability: 1. Compute and store data in multiple region or availability zones (AZs).
+                 2. Store data in multi region with geo-redundancy, Enable replication to backup region.
+                 3. Use Primary replica databases, if primary fail LB reroute request to healthy replica.
+
+=> Cost Efficiency: 1. Video Deduplication:
+                        a. User may upload same video multiple times.
+                        b. Identify deduplication by hashing (SHA-256, MD5) of video file, if hash matches existing file store reference  instead of copy.
+                        c. Detect similar but slightly edited files.
+                        d. Use ML model to compare video/audio frames which are near deduplicates.
+
+                    2. Multi-Tiered Storage (Hot, Warm, Cold):
+                        a. Frequently watched videos → Hot Storage (SSD-backed, fast access).
+                        b. Less popular videos → Warm Storage (HDD-backed, moderate latency).
+                        c. Rarely accessed videos → Cold Storage (AWS Glacier, Google Coldline).
